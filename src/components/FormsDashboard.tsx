@@ -45,7 +45,7 @@ export const FormsDashboard: React.FC<FormsDashboardProps> = ({
   const [seeding, setSeeding] = useState(false);
 
   const handleCopyLink = (formUid: string) => {
-    const url = `${window.location.origin}?form=${formUid}`;
+    const url = `${window.location.origin}${window.location.pathname}?form=${formUid}`;
     navigator.clipboard.writeText(url);
     setCopiedUid(formUid);
     setTimeout(() => setCopiedUid(null), 2500);

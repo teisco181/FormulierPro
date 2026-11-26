@@ -113,6 +113,12 @@ export function formatFirebaseAuthError(error: any): { message: string; code: st
         code,
         message: 'Log opnieuw in om deze beveiligingswijziging te bevestigen.',
       };
+    case 'auth/unauthorized-domain':
+      return {
+        code,
+        message:
+          'Dit domein (bijv. github.io) moet nog worden toegevoegd onder Authorized domains in Firebase Authentication.',
+      };
     default:
       return {
         code,
