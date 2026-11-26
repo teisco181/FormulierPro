@@ -749,8 +749,14 @@ export function installStaticApiBridge() {
   }
   (window as any).__staticApiBridgeInstalled = true;
 
+  const ownDesc = Object.getOwnPropertyDescriptor(window, 'fetch');
+  if (ownDesc && ((ownDesc.get && !ownDesc.set) || (!ownDesc.writable && !ownDesc.configurable))) {
+    // Host environment locks or proxies window.fetch (e.g. AI Studio preview); skip override
+    return;
+  }
+
   const originalFetch = window.fetch.bind(window);
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const wrappedFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const rawUrl = typeof input === 'string' ? input : input instanceof Request ? input.url : input.toString();
 
     let urlObj: URL;
@@ -783,4 +789,15 @@ export function installStaticApiBridge() {
     const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
     return handleStaticApi(apiPath, urlObj.search, method, init);
   };
+
+  try {
+    Object.defineProperty(window, 'fetch', {
+      value: wrappedFetch,
+      configurable: true,
+      writable: true,
+      enumerable: true,
+    });
+  } catch {
+    // Fallback ignored if host prevents redefining window.fetch
+  }
 }
