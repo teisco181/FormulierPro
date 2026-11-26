@@ -715,6 +715,242 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     });
   }
 
+  // POST /api/studyflow/generate (static fallback strictly using supplied source text)
+  if (pathname === '/api/studyflow/generate' && method === 'POST') {
+    const vak: string = typeof body?.vak === 'string' && body.vak.trim() ? body.vak.trim() : 'Algemeen';
+    const titel: string = typeof body?.titel === 'string' && body.titel.trim() ? body.titel.trim() : 'Lesstof';
+    const tekst: string = typeof body?.tekst === 'string' ? body.tekst.trim() : '';
+    if (!tekst) {
+      return jsonResponse({ error: 'Er is geen lesstof ontvangen vanuit StudyFlow.' }, 400);
+    }
+
+    const count: 5 | 10 | 15 = body?.count === 10 || body?.count === 15 ? body.count : 5;
+    const questionType: 'meerkeuze' | 'open' | 'gemengd' =
+      body?.questionType === 'meerkeuze' || body?.questionType === 'open' || body?.questionType === 'gemengd'
+        ? body.questionType
+        : 'gemengd';
+    const difficulty: 'makkelijk' | 'gemiddeld' | 'moeilijk' =
+      body?.difficulty === 'makkelijk' || body?.difficulty === 'moeilijk' || body?.difficulty === 'gemiddeld'
+        ? body.difficulty
+        : 'gemiddeld';
+
+    const sentences: string[] = tekst
+      .replace(/\s+/g, ' ')
+      .split(/(?<=[.!?])\s+|\n+/)
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length >= 25);
+
+    const usableSentences: string[] = sentences.length > 0 ? sentences : [tekst];
+
+    // Collect key candidate terms/phrases exclusively from the supplied text
+    const stopWords = new Set([
+      'deze', 'dit', 'dat', 'voor', 'naar', 'door', 'met', 'van', 'een', 'het', 'zijn', 'worden',
+      'wordt', 'heeft', 'hebben', 'maar', 'want', 'omdat', 'zoals', 'waarbij', 'waarin', 'tussen',
+      'onder', 'boven', 'over', 'tegen', 'zonder', 'tijdens', 'alleen', 'ook', 'nog', 'wel', 'niet',
+      'geen', 'meer', 'veel', 'weinig', 'vaak', 'soms', 'altijd', 'nooit', 'hier', 'daar', 'toen',
+      'wanneer', 'waarom', 'welke', 'welk', 'iedere', 'elke', 'alle', 'sommige', 'andere', 'ander',
+    ]);
+
+    const keyTerms: string[] = Array.from(
+      new Set<string>(
+        tekst
+          .split(/[^a-zA-Z0-9àáâäèéêëìíîïòóôöùúûüÀÁÂÄÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ-]+/)
+          .map((w: string) => w.trim())
+          .filter((w: string) => w.length >= 5 && !stopWords.has(w.toLowerCase()))
+      )
+    );
+
+    const questionsOut: Array<{
+      id: number;
+      category: string;
+      questionType: 'multiple_choice' | 'open';
+      questionText: string;
+      options?: string[];
+      correctAnswer: string;
+      rubric: string;
+      points: number;
+    }> = [];
+
+    for (let i = 0; i < count; i++) {
+      const sentence = usableSentences[i % usableSentences.length];
+      const useOpen =
+        questionType === 'open'
+          ? true
+          : questionType === 'meerkeuze'
+          ? false
+          : i % 2 === 1;
+
+      const sentenceWords: string[] = sentence
+        .split(/[^a-zA-Z0-9àáâäèéêëìíîïòóôöùúûüÀÁÂÄÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ-]+/)
+        .map((w: string) => w.trim())
+        .filter((w: string) => w.length >= 5 && !stopWords.has(w.toLowerCase()));
+
+      // Pick a prominent term from this sentence (prefer longer / capitalized term)
+      const targetWord: string =
+        sentenceWords
+          .slice()
+          .sort((a: string, b: string) => b.length - a.length)[0] ||
+        keyTerms[i % Math.max(1, keyTerms.length)] ||
+        titel;
+
+      if (!useOpen && targetWord && sentence.toLowerCase().includes(targetWord.toLowerCase())) {
+        const masked = sentence.replace(
+          new RegExp(`\\b${targetWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
+          '________'
+        );
+
+        const distractors = keyTerms
+          .filter((t: string) => t.toLowerCase() !== targetWord.toLowerCase())
+          .slice(0, 20)
+          .sort(() => 0.5 - Math.random())
+          .slice(0, 3);
+
+        while (distractors.length < 3) {
+          distractors.push(`Geen van de bovenstaande (${distractors.length + 1})`);
+        }
+
+        const options = [targetWord, ...distractors].sort(() => 0.5 - Math.random());
+        const prefix =
+          difficulty === 'makkelijk'
+            ? `Welk begrip uit "${titel}" past op de open plek?`
+            : difficulty === 'moeilijk'
+            ? `Welk kernbegrip vult deze redenering uit "${titel}" inhoudelijk juist aan?`
+            : `Welk begrip uit de lesstof hoort op de lege plek in deze zin?`;
+
+        questionsOut.push({
+          id: i + 1,
+          category: vak,
+          questionType: 'multiple_choice',
+          questionText: `${prefix}\n"${masked}"`,
+          options,
+          correctAnswer: targetWord,
+          rubric: `Volledige zin uit de lesstof: "${sentence}"`,
+          points: 1,
+        });
+      } else {
+        const snippet = sentence.length > 140 ? `${sentence.slice(0, 140)}...` : sentence;
+        const promptByDiff =
+          difficulty === 'makkelijk'
+            ? `Wat wordt er in de lesstof "${titel}" gezegd over "${targetWord}"?`
+            : difficulty === 'moeilijk'
+            ? `Leg in eigen woorden het verband en de betekenis uit van "${targetWord}" binnen de lesstof "${titel}" (verwijs naar: "${snippet.slice(0, 60)}...").`
+            : `Leg op basis van de lesstof "${titel}" uit wat bedoeld wordt met "${targetWord}".`;
+
+        questionsOut.push({
+          id: i + 1,
+          category: vak,
+          questionType: 'open',
+          questionText: promptByDiff,
+          correctAnswer: sentence,
+          rubric: `Benoem de kern uit de lesstof rondom ${targetWord}: ${sentence}`,
+          points: 2,
+        });
+      }
+    }
+
+    return jsonResponse({ success: true, questions: questionsOut });
+  }
+
+  // POST /api/studyflow/grade (static fallback grading)
+  if (pathname === '/api/studyflow/grade' && method === 'POST') {
+    const questionsList = Array.isArray(body?.questions) ? body.questions : [];
+    const answersMap: Record<string, string> =
+      body?.answers && typeof body.answers === 'object' ? body.answers : {};
+
+    if (questionsList.length === 0) {
+      return jsonResponse({ error: 'Geen vragen om na te kijken.' }, 400);
+    }
+
+    let totalScore = 0;
+    let maxScore = 0;
+    const vragen: Array<{
+      vraag: string;
+      gegevenAntwoord: string;
+      juistAntwoord: string;
+      goed: boolean;
+    }> = [];
+    const detailedAnswers: Array<any> = [];
+
+    for (let i = 0; i < questionsList.length; i++) {
+      const q = questionsList[i];
+      const qId = Number(q?.id ?? i + 1);
+      const qText = String(q?.questionText || '');
+      const qType = q?.questionType === 'open' ? 'open' : 'multiple_choice';
+      const qCategory = String(q?.category || 'Algemeen');
+      const qPoints = Math.max(1, Number(q?.points) || 1);
+      const correctAns = String(q?.correctAnswer || '');
+      const rubric = String(q?.rubric || correctAns);
+      const studentAns = String(answersMap[String(qId)] || '').trim();
+
+      maxScore += qPoints;
+
+      let scoreAwarded = 0;
+      let isCorrect = false;
+      let feedback = '';
+
+      if (qType === 'multiple_choice') {
+        if (studentAns && studentAns.toLowerCase() === correctAns.trim().toLowerCase()) {
+          scoreAwarded = qPoints;
+          isCorrect = true;
+          feedback = rubric ? `Correct! ${rubric}` : 'Correct beantwoord!';
+        } else {
+          scoreAwarded = 0;
+          isCorrect = false;
+          feedback = rubric ? `Juiste antwoord: ${correctAns}. ${rubric}` : `Juiste antwoord: ${correctAns}`;
+        }
+      } else {
+        const res = gradeOpenLocal(
+          {
+            id: qId,
+            formId: 0,
+            category: qCategory,
+            questionType: 'open',
+            questionText: qText,
+            options: '[]',
+            correctAnswer: correctAns,
+            points: qPoints,
+            rubric,
+            orderIndex: i,
+          },
+          studentAns
+        );
+        scoreAwarded = res.scoreAwarded;
+        isCorrect = res.isCorrect === 1;
+        feedback = res.feedback;
+      }
+
+      totalScore += scoreAwarded;
+      vragen.push({
+        vraag: qText,
+        gegevenAntwoord: studentAns,
+        juistAntwoord: correctAns,
+        goed: isCorrect,
+      });
+      detailedAnswers.push({
+        questionId: qId,
+        questionText: qText,
+        questionCategory: qCategory,
+        questionType: qType,
+        answerValue: studentAns,
+        correctAnswer: correctAns,
+        isCorrect: isCorrect ? 1 : 0,
+        scoreAwarded,
+        maxPoints: qPoints,
+        aiFeedback: feedback,
+      });
+    }
+
+    const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 100;
+    return jsonResponse({
+      success: true,
+      totalScore,
+      maxScore,
+      percentage,
+      vragen,
+      answers: detailedAnswers,
+    });
+  }
+
   // AI question generation is server-only
   if (pathname === '/api/ai/generate-questions') {
     return jsonResponse(

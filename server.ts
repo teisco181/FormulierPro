@@ -10,7 +10,7 @@ import { eq, desc, and, inArray } from 'drizzle-orm';
 import { requireAuth, optionalAuth, AuthRequest } from './src/middleware/auth.ts';
 import { getOrCreateUser } from './src/db/users.ts';
 import { gradeOpenQuestion } from './src/services/ai-grader.ts';
-import { generateQuestionsWithAI } from './src/services/ai-generator.ts';
+import { generateQuestionsWithAI, generateStudyFlowQuiz } from './src/services/ai-generator.ts';
 
 dotenv.config();
 
@@ -324,6 +324,169 @@ app.post('/api/ai/generate-questions', requireAuth, async (req: AuthRequest, res
   } catch (error: any) {
     console.error('AI Question Gen error:', error);
     res.status(500).json({ error: error.message || 'Fout bij genereren van vragen.' });
+  }
+});
+
+// 4b. StudyFlow iframe quiz generation (uses Gemini with supplied source text)
+app.post('/api/studyflow/generate', async (req: Request, res: Response) => {
+  try {
+    const rawVak = typeof req.body?.vak === 'string' ? req.body.vak.trim() : 'Algemeen';
+    const rawTitel = typeof req.body?.titel === 'string' ? req.body.titel.trim() : 'Lesstof';
+    const rawTekst = typeof req.body?.tekst === 'string' ? req.body.tekst.trim() : '';
+
+    if (!rawTekst) {
+      return res.status(400).json({ error: 'Er is geen lesstof ontvangen vanuit StudyFlow.' });
+    }
+
+    const allowedCounts = [5, 10, 15] as const;
+    const rawCount = Number(req.body?.count);
+    const count: 5 | 10 | 15 = allowedCounts.includes(rawCount as 5 | 10 | 15)
+      ? (rawCount as 5 | 10 | 15)
+      : 5;
+
+    const rawType = req.body?.questionType;
+    const questionType: 'meerkeuze' | 'open' | 'gemengd' =
+      rawType === 'meerkeuze' || rawType === 'open' || rawType === 'gemengd'
+        ? rawType
+        : 'gemengd';
+
+    const rawDifficulty = req.body?.difficulty;
+    const difficulty: 'makkelijk' | 'gemiddeld' | 'moeilijk' =
+      rawDifficulty === 'makkelijk' || rawDifficulty === 'gemiddeld' || rawDifficulty === 'moeilijk'
+        ? rawDifficulty
+        : 'gemiddeld';
+
+    const generated = await generateStudyFlowQuiz({
+      vak: rawVak.slice(0, 120),
+      titel: rawTitel.slice(0, 200),
+      tekst: rawTekst.slice(0, 40000),
+      count,
+      questionType,
+      difficulty,
+    });
+
+    const formatted = generated.map((q, idx) => ({
+      id: idx + 1,
+      ...q,
+    }));
+
+    res.json({ success: true, questions: formatted });
+  } catch (error: any) {
+    console.error('StudyFlow AI generation error:', error);
+    res.status(500).json({ error: error.message || 'Kon geen toets genereren uit de lesstof.' });
+  }
+});
+
+// 4c. StudyFlow iframe quiz grading (uses Gemini for open questions)
+app.post('/api/studyflow/grade', async (req: Request, res: Response) => {
+  try {
+    const questionsList = Array.isArray(req.body?.questions) ? req.body.questions.slice(0, 50) : [];
+    const answersMap: Record<string, string> =
+      req.body?.answers && typeof req.body.answers === 'object' ? req.body.answers : {};
+
+    if (questionsList.length === 0) {
+      return res.status(400).json({ error: 'Geen vragen om na te kijken.' });
+    }
+
+    let totalScore = 0;
+    let maxScore = 0;
+    const vragen: Array<{
+      vraag: string;
+      gegevenAntwoord: string;
+      juistAntwoord: string;
+      goed: boolean;
+    }> = [];
+    const detailedAnswers: Array<{
+      questionId: number;
+      questionText: string;
+      questionCategory: string;
+      questionType: string;
+      answerValue: string;
+      correctAnswer: string;
+      isCorrect: number;
+      scoreAwarded: number;
+      maxPoints: number;
+      aiFeedback: string;
+    }> = [];
+
+    for (let i = 0; i < questionsList.length; i++) {
+      const q = questionsList[i];
+      const qId = Number(q?.id ?? i + 1);
+      const qText = String(q?.questionText || '');
+      const qType = q?.questionType === 'open' ? 'open' : 'multiple_choice';
+      const qCategory = String(q?.category || 'Algemeen');
+      const qPoints = Math.max(1, Number(q?.points) || 1);
+      const correctAns = String(q?.correctAnswer || '');
+      const rubric = String(q?.rubric || correctAns);
+      const studentAns = String(answersMap[String(qId)] || '').trim();
+
+      maxScore += qPoints;
+
+      let scoreAwarded = 0;
+      let isCorrect = false;
+      let feedback = '';
+
+      if (qType === 'multiple_choice') {
+        if (studentAns && studentAns.toLowerCase() === correctAns.trim().toLowerCase()) {
+          scoreAwarded = qPoints;
+          isCorrect = true;
+          feedback = rubric ? `Correct! ${rubric}` : 'Correct beantwoord!';
+        } else {
+          scoreAwarded = 0;
+          isCorrect = false;
+          feedback = rubric
+            ? `Juiste antwoord: ${correctAns}. Toelichting: ${rubric}`
+            : `Juiste antwoord: ${correctAns}`;
+        }
+      } else {
+        const grading = await gradeOpenQuestion({
+          questionText: qText,
+          category: qCategory,
+          rubric,
+          studentAnswer: studentAns,
+          maxPoints: qPoints,
+        });
+        scoreAwarded = grading.scoreAwarded;
+        isCorrect = grading.isCorrect;
+        feedback = grading.feedback;
+      }
+
+      totalScore += scoreAwarded;
+
+      vragen.push({
+        vraag: qText,
+        gegevenAntwoord: studentAns,
+        juistAntwoord: correctAns,
+        goed: isCorrect,
+      });
+
+      detailedAnswers.push({
+        questionId: qId,
+        questionText: qText,
+        questionCategory: qCategory,
+        questionType: qType,
+        answerValue: studentAns,
+        correctAnswer: correctAns,
+        isCorrect: isCorrect ? 1 : 0,
+        scoreAwarded,
+        maxPoints: qPoints,
+        aiFeedback: feedback,
+      });
+    }
+
+    const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 100;
+
+    res.json({
+      success: true,
+      totalScore,
+      maxScore,
+      percentage,
+      vragen,
+      answers: detailedAnswers,
+    });
+  } catch (error: any) {
+    console.error('StudyFlow grading error:', error);
+    res.status(500).json({ error: error.message || 'Fout bij nakijken van de toets.' });
   }
 });
 

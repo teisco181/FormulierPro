@@ -89,9 +89,16 @@ Geef je beoordeling UITSLUITEND als een geldig JSON-object in dit exacte formaat
 
   // Use Gemini as default high-speed high-accuracy engine
   try {
-    const ai = new GoogleGenAI();
+    const ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-4-hydrogen',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',

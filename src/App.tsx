@@ -7,6 +7,14 @@ import { AnalyticsView } from './components/AnalyticsView.tsx';
 import { FormTaker } from './components/FormTaker.tsx';
 import { RespondentProgressDashboard } from './components/RespondentProgressDashboard.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
+import { StudyFlowRunner } from './components/StudyFlowRunner.tsx';
+import {
+  STUDYFLOW_ORIGIN,
+  StudyFlowStofPayload,
+  isInsideIframe,
+  isEmbeddedInStudyFlow,
+  postToStudyFlowReady,
+} from './lib/studyflow.ts';
 import { FormModel } from './types/index.ts';
 
 function MainApp() {
@@ -18,6 +26,49 @@ function MainApp() {
   const [selectedFormUid, setSelectedFormUid] = useState<string | null>(null);
   const [formToEdit, setFormToEdit] = useState<FormModel | null>(null);
   const [isBuilderOpen, setIsBuilderOpen] = useState(false);
+
+  // StudyFlow iframe state
+  const [inIframe] = useState<boolean>(() => isInsideIframe());
+  const [studyFlowEmbedded] = useState<boolean>(() => isEmbeddedInStudyFlow());
+  const [studyFlowStof, setStudyFlowStof] = useState<StudyFlowStofPayload | null>(null);
+
+  // StudyFlow postMessage integration (runs only inside iframe)
+  useEffect(() => {
+    if (!inIframe) return;
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== STUDYFLOW_ORIGIN) return;
+      const msg = event.data;
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'STUDYFLOW_STOF' && msg.payload && typeof msg.payload === 'object') {
+        const vak = typeof msg.payload.vak === 'string' ? msg.payload.vak.trim() : '';
+        const titel = typeof msg.payload.titel === 'string' ? msg.payload.titel.trim() : '';
+        const tekst = typeof msg.payload.tekst === 'string' ? msg.payload.tekst.trim() : '';
+
+        if (tekst) {
+          const nextStof: StudyFlowStofPayload = {
+            vak: vak || 'Algemeen',
+            titel: titel || 'Lesstof',
+            tekst,
+          };
+          setStudyFlowStof(nextStof);
+          try {
+            window.localStorage.setItem('formulierpro_studyflow_stof', JSON.stringify(nextStof));
+          } catch {
+            // Ignore localStorage quota errors
+          }
+        }
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    postToStudyFlowReady();
+
+    return () => {
+      window.removeEventListener('message', handleMessage);
+    };
+  }, [inIframe]);
 
   // Check URL query parameters for ?form=...
   useEffect(() => {
@@ -217,6 +268,16 @@ function MainApp() {
     }
     setIsBuilderOpen(true);
   };
+
+  // When embedded in StudyFlow (or after receiving STUDYFLOW_STOF), render compact iframe view without duplicate header/nav
+  const isStudyFlowView = inIframe && (studyFlowEmbedded || studyFlowStof !== null);
+  if (isStudyFlowView) {
+    return (
+      <div className="w-full bg-slate-50 font-['Plus_Jakarta_Sans',sans-serif]">
+        <StudyFlowRunner stof={studyFlowStof} inIframe={inIframe} />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-['Plus_Jakarta_Sans',sans-serif]">
