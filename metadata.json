@@ -1,0 +1,6 @@
+{
+  "name": "FormulierPro - Geavanceerde Formulieren & Toetsenmaker",
+  "description": "Professionele Google Forms applicatie met toetsstand, AI automatische beoordeling, categorieën & shuffling, SQL-voortgangsanalyses en Excel export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
