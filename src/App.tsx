@@ -108,7 +108,7 @@ function MainApp() {
     };
   }, [inIframe]);
 
-  // Check URL query parameters for ?form=...
+  // Check URL query parameters for ?form=... or ?email=... / ?login_hint=...
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const formParam = params.get('form');
@@ -117,6 +117,23 @@ function MainApp() {
       setActiveView('taker');
     }
   }, []);
+
+  useEffect(() => {
+    if (inIframe || authLoading) return;
+    const params = new URLSearchParams(window.location.search);
+    const emailParam = (params.get('email') || params.get('login_hint') || '').trim();
+    if (!emailParam) return;
+
+    if (!user) {
+      openAuthModal('login', emailParam);
+    }
+
+    // Clean query parameter from URL bar without losing ?form=... if present
+    params.delete('email');
+    params.delete('login_hint');
+    const qs = params.toString();
+    window.history.replaceState({}, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
+  }, [inIframe, authLoading, user]);
 
   // Fetch user forms
   const fetchForms = async () => {

@@ -22,7 +22,7 @@ interface AuthContextType {
   token: string | null;
   hasPasswordProvider: boolean;
   hasGoogleProvider: boolean;
-  signInWithGoogle: () => Promise<void>;
+  signInWithGoogle: (loginHint?: string) => Promise<void>;
   signInWithEmail: (email: string, password: string) => Promise<void>;
   registerWithEmail: (email: string, password: string, name?: string) => Promise<void>;
   sendPasswordReset: (email: string) => Promise<void>;
@@ -31,7 +31,8 @@ interface AuthContextType {
   getToken: () => Promise<string | null>;
   isAuthModalOpen: boolean;
   authModalMode: AuthModalMode;
-  openAuthModal: (mode?: AuthModalMode) => void;
+  prefilledEmail: string;
+  openAuthModal: (mode?: AuthModalMode, emailHint?: string) => void;
   closeAuthModal: () => void;
 }
 
@@ -50,6 +51,7 @@ const AuthContext = createContext<AuthContextType>({
   getToken: async () => null,
   isAuthModalOpen: false,
   authModalMode: 'login',
+  prefilledEmail: '',
   openAuthModal: () => {},
   closeAuthModal: () => {},
 });
@@ -147,6 +149,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [providerVersion, setProviderVersion] = useState(0);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('login');
+  const [prefilledEmail, setPrefilledEmail] = useState('');
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
@@ -175,8 +178,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
   void providerVersion;
 
-  const openAuthModal = (mode: AuthModalMode = 'login') => {
+  const openAuthModal = (mode: AuthModalMode = 'login', emailHint?: string) => {
     setAuthModalMode(mode);
+    if (typeof emailHint === 'string' && emailHint.trim()) {
+      setPrefilledEmail(emailHint.trim());
+    }
     setIsAuthModalOpen(true);
   };
 
@@ -184,7 +190,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setIsAuthModalOpen(false);
   };
 
-  const signInWithGoogle = async () => {
+  const signInWithGoogle = async (loginHint?: string) => {
+    const cleanHint = (loginHint || prefilledEmail || '').trim();
+    if (cleanHint) {
+      googleAuthProvider.setCustomParameters({ login_hint: cleanHint });
+    } else {
+      googleAuthProvider.setCustomParameters({});
+    }
     const result = await signInWithPopup(auth, googleAuthProvider);
     const idToken = await syncUserWithBackend(result.user);
     setUser(result.user);
@@ -271,6 +283,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         getToken,
         isAuthModalOpen,
         authModalMode,
+        prefilledEmail,
         openAuthModal,
         closeAuthModal,
       }}

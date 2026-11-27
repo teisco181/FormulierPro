@@ -23,6 +23,7 @@ export const AuthModal: React.FC = () => {
     user,
     isAuthModalOpen,
     authModalMode,
+    prefilledEmail,
     closeAuthModal,
     signInWithGoogle,
     signInWithEmail,
@@ -54,9 +55,12 @@ export const AuthModal: React.FC = () => {
       setConfirmPassword('');
       if (authModalMode !== 'link_password') {
         setName('');
+        if (prefilledEmail) {
+          setEmail(prefilledEmail);
+        }
       }
     }
-  }, [isAuthModalOpen, authModalMode]);
+  }, [isAuthModalOpen, authModalMode, prefilledEmail]);
 
   if (!isAuthModalOpen) return null;
 
@@ -73,7 +77,7 @@ export const AuthModal: React.FC = () => {
     setSuccessMsg(null);
     setGoogleLoading(true);
     try {
-      await signInWithGoogle();
+      await signInWithGoogle(email || prefilledEmail);
       closeAuthModal();
     } catch (err: any) {
       const formatted = formatFirebaseAuthError(err);
