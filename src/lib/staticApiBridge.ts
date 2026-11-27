@@ -1,5 +1,6 @@
 import * as XLSX from 'xlsx';
 import { auth } from './firebase.ts';
+import { generateLocalStudyFlowQuiz, gradeLocalStudyFlowOpen } from './localStudyFlowQuiz.ts';
 
 const STORAGE_KEY = 'formulierpro_static_store_v1';
 
@@ -20,6 +21,7 @@ interface StoredForm {
   id: number;
   formUid: string;
   creatorUid: string;
+  creatorEmail?: string | null;
   title: string;
   description: string;
   mode: string;
@@ -121,9 +123,21 @@ function getCurrentUserFromContext() {
   if (!current) return null;
   return {
     uid: current.uid,
-    email: current.email || `${current.uid}@guest.local`,
+    email: (current.email || `${current.uid}@guest.local`).toLowerCase().trim(),
     name: current.displayName || current.email?.split('@')[0] || 'Gebruiker',
   };
+}
+
+function isFormOwnerStatic(
+  form: StoredForm,
+  user: { uid: string; email: string } | null
+): boolean {
+  if (!user) return false;
+  if (form.creatorUid === user.uid) return true;
+  if (user.email && form.creatorEmail && form.creatorEmail.toLowerCase() === user.email.toLowerCase()) {
+    return true;
+  }
+  return false;
 }
 
 function parseJsonBody(init?: RequestInit): any {
@@ -197,7 +211,7 @@ async function handleStaticApi(pathname: string, search: string, method: string,
   if (pathname === '/api/forms' && method === 'GET') {
     if (!user) return jsonResponse({ error: 'Unauthorized' }, 401);
     const list = store.forms
-      .filter((f) => f.creatorUid === user.uid)
+      .filter((f) => isFormOwnerStatic(f, user))
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     return jsonResponse(list);
   }
@@ -207,10 +221,16 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     if (!user) return jsonResponse({ error: 'Unauthorized' }, 401);
     const formId = store.nextId++;
     const now = new Date().toISOString();
+    const creatorEmail =
+      (typeof body.creatorEmail === 'string' && body.creatorEmail.trim()
+        ? body.creatorEmail.trim().toLowerCase()
+        : user.email.toLowerCase()) || null;
+
     const newForm: StoredForm = {
       id: formId,
       formUid: generateUid('form'),
       creatorUid: user.uid,
+      creatorEmail,
       title: body.title || 'Nieuw Formulier',
       description: body.description || '',
       mode: body.mode || 'exam',
@@ -262,7 +282,7 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     if (!form) return jsonResponse({ error: 'Formulier niet gevonden.' }, 404);
 
     if (method === 'GET') {
-      const isCreator = Boolean(user && user.uid === form.creatorUid);
+      const isCreator = isFormOwnerStatic(form, user);
       const qList = store.questions
         .filter((q) => q.formId === form.id)
         .sort((a, b) => a.orderIndex - b.orderIndex);
@@ -296,7 +316,7 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     }
 
     if (method === 'PUT') {
-      if (!user || user.uid !== form.creatorUid) {
+      if (!isFormOwnerStatic(form, user)) {
         return jsonResponse({ error: 'Geen toegang.' }, 403);
       }
       form.title = body.title ?? form.title;
@@ -340,7 +360,7 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     }
 
     if (method === 'DELETE') {
-      if (!user || user.uid !== form.creatorUid) {
+      if (!isFormOwnerStatic(form, user)) {
         return jsonResponse({ error: 'Geen toegang.' }, 403);
       }
       const subIds = store.submissions.filter((s) => s.formId === form.id).map((s) => s.id);
@@ -443,7 +463,7 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     if (!sub) return jsonResponse({ error: 'Sessie niet gevonden.' }, 404);
     const form = store.forms.find((f) => f.id === sub.formId);
     if (!form) return jsonResponse({ error: 'Formulier niet gevonden.' }, 404);
-    const isCreator = Boolean(user && user.uid === form.creatorUid);
+    const isCreator = isFormOwnerStatic(form, user);
     const isPasscodeValid = body.passcode && String(body.passcode).trim() === form.securityPasscode.trim();
     if (!isCreator && !isPasscodeValid) {
       return jsonResponse({ error: 'Onjuiste docenten-ontgrendelcode.' }, 403);
@@ -578,7 +598,7 @@ async function handleStaticApi(pathname: string, search: string, method: string,
   if (analyticsMatch && method === 'GET') {
     const form = store.forms.find((f) => f.formUid === decodeURIComponent(analyticsMatch[1]));
     if (!form) return jsonResponse({ error: 'Formulier niet gevonden.' }, 404);
-    if (!user || user.uid !== form.creatorUid) {
+    if (!isFormOwnerStatic(form, user)) {
       return jsonResponse({ error: 'Geen toegang tot deze analyses.' }, 403);
     }
 
@@ -715,7 +735,74 @@ async function handleStaticApi(pathname: string, search: string, method: string,
     });
   }
 
-  // POST /api/studyflow/generate (static fallback strictly using supplied source text)
+  // POST /api/forms/:formUid/record-studyflow-attempt
+  const recordAttemptMatch = pathname.match(/^\/api\/forms\/([^/]+)\/record-studyflow-attempt$/);
+  if (recordAttemptMatch && method === 'POST') {
+    if (!user) return jsonResponse({ error: 'Unauthorized' }, 401);
+    const formUid = decodeURIComponent(recordAttemptMatch[1]);
+    const form = store.forms.find((f) => f.formUid === formUid);
+    if (!form) return jsonResponse({ error: 'Formulier niet gevonden.' }, 404);
+    if (!isFormOwnerStatic(form, user)) {
+      return jsonResponse({ error: 'Geen toegang.' }, 403);
+    }
+
+    const totalScore = Number(body?.totalScore) || 0;
+    const maxScore = Number(body?.maxScore) || 0;
+    const percentage =
+      typeof body?.percentage === 'number'
+        ? Math.round(body.percentage)
+        : maxScore > 0
+        ? Math.round((totalScore / maxScore) * 100)
+        : 100;
+    const now = new Date().toISOString();
+    const submissionId = store.nextId++;
+    const sub: StoredSubmission = {
+      id: submissionId,
+      formId: form.id,
+      submissionUid: generateUid('sub'),
+      respondentEmail: user.email.toLowerCase(),
+      respondentName: user.name,
+      totalScore,
+      maxScore,
+      percentage,
+      timeSpentSeconds: Number(body?.timeSpentSeconds) || 0,
+      status: 'submitted',
+      lockReason: null,
+      isUnlockedByMaker: 0,
+      completedAt: now,
+      createdAt: now,
+    };
+    store.submissions.push(sub);
+
+    const formQs = store.questions
+      .filter((q) => q.formId === form.id)
+      .sort((a, b) => a.orderIndex - b.orderIndex);
+
+    if (Array.isArray(body?.answers)) {
+      body.answers.forEach((a: any, idx: number) => {
+        const matchedQ = formQs[idx] || formQs.find((q) => q.questionText === a.questionText);
+        store.answers.push({
+          id: store.nextId++,
+          submissionId,
+          questionId: matchedQ ? matchedQ.id : 0,
+          questionText: String(a.questionText || matchedQ?.questionText || ''),
+          questionCategory: String(a.questionCategory || matchedQ?.category || 'Algemeen'),
+          questionType: String(a.questionType || matchedQ?.questionType || 'multiple_choice'),
+          answerValue: String(a.answerValue || ''),
+          isCorrect: a.isCorrect ? 1 : 0,
+          scoreAwarded: Number(a.scoreAwarded) || 0,
+          maxPoints: Number(a.maxPoints) || matchedQ?.points || 1,
+          aiFeedback: String(a.aiFeedback || ''),
+          manualFeedback: null,
+        });
+      });
+    }
+
+    saveStore(store);
+    return jsonResponse({ success: true, submissionUid: sub.submissionUid });
+  }
+
+  // POST /api/studyflow/generate (static fallback strictly using supplied source text, including word lists)
   if (pathname === '/api/studyflow/generate' && method === 'POST') {
     const vak: string = typeof body?.vak === 'string' && body.vak.trim() ? body.vak.trim() : 'Algemeen';
     const titel: string = typeof body?.titel === 'string' && body.titel.trim() ? body.titel.trim() : 'Lesstof';
@@ -734,119 +821,14 @@ async function handleStaticApi(pathname: string, search: string, method: string,
         ? body.difficulty
         : 'gemiddeld';
 
-    const sentences: string[] = tekst
-      .replace(/\s+/g, ' ')
-      .split(/(?<=[.!?])\s+|\n+/)
-      .map((s: string) => s.trim())
-      .filter((s: string) => s.length >= 25);
-
-    const usableSentences: string[] = sentences.length > 0 ? sentences : [tekst];
-
-    // Collect key candidate terms/phrases exclusively from the supplied text
-    const stopWords = new Set([
-      'deze', 'dit', 'dat', 'voor', 'naar', 'door', 'met', 'van', 'een', 'het', 'zijn', 'worden',
-      'wordt', 'heeft', 'hebben', 'maar', 'want', 'omdat', 'zoals', 'waarbij', 'waarin', 'tussen',
-      'onder', 'boven', 'over', 'tegen', 'zonder', 'tijdens', 'alleen', 'ook', 'nog', 'wel', 'niet',
-      'geen', 'meer', 'veel', 'weinig', 'vaak', 'soms', 'altijd', 'nooit', 'hier', 'daar', 'toen',
-      'wanneer', 'waarom', 'welke', 'welk', 'iedere', 'elke', 'alle', 'sommige', 'andere', 'ander',
-    ]);
-
-    const keyTerms: string[] = Array.from(
-      new Set<string>(
-        tekst
-          .split(/[^a-zA-Z0-9àáâäèéêëìíîïòóôöùúûüÀÁÂÄÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ-]+/)
-          .map((w: string) => w.trim())
-          .filter((w: string) => w.length >= 5 && !stopWords.has(w.toLowerCase()))
-      )
-    );
-
-    const questionsOut: Array<{
-      id: number;
-      category: string;
-      questionType: 'multiple_choice' | 'open';
-      questionText: string;
-      options?: string[];
-      correctAnswer: string;
-      rubric: string;
-      points: number;
-    }> = [];
-
-    for (let i = 0; i < count; i++) {
-      const sentence = usableSentences[i % usableSentences.length];
-      const useOpen =
-        questionType === 'open'
-          ? true
-          : questionType === 'meerkeuze'
-          ? false
-          : i % 2 === 1;
-
-      const sentenceWords: string[] = sentence
-        .split(/[^a-zA-Z0-9àáâäèéêëìíîïòóôöùúûüÀÁÂÄÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ-]+/)
-        .map((w: string) => w.trim())
-        .filter((w: string) => w.length >= 5 && !stopWords.has(w.toLowerCase()));
-
-      // Pick a prominent term from this sentence (prefer longer / capitalized term)
-      const targetWord: string =
-        sentenceWords
-          .slice()
-          .sort((a: string, b: string) => b.length - a.length)[0] ||
-        keyTerms[i % Math.max(1, keyTerms.length)] ||
-        titel;
-
-      if (!useOpen && targetWord && sentence.toLowerCase().includes(targetWord.toLowerCase())) {
-        const masked = sentence.replace(
-          new RegExp(`\\b${targetWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
-          '________'
-        );
-
-        const distractors = keyTerms
-          .filter((t: string) => t.toLowerCase() !== targetWord.toLowerCase())
-          .slice(0, 20)
-          .sort(() => 0.5 - Math.random())
-          .slice(0, 3);
-
-        while (distractors.length < 3) {
-          distractors.push(`Geen van de bovenstaande (${distractors.length + 1})`);
-        }
-
-        const options = [targetWord, ...distractors].sort(() => 0.5 - Math.random());
-        const prefix =
-          difficulty === 'makkelijk'
-            ? `Welk begrip uit "${titel}" past op de open plek?`
-            : difficulty === 'moeilijk'
-            ? `Welk kernbegrip vult deze redenering uit "${titel}" inhoudelijk juist aan?`
-            : `Welk begrip uit de lesstof hoort op de lege plek in deze zin?`;
-
-        questionsOut.push({
-          id: i + 1,
-          category: vak,
-          questionType: 'multiple_choice',
-          questionText: `${prefix}\n"${masked}"`,
-          options,
-          correctAnswer: targetWord,
-          rubric: `Volledige zin uit de lesstof: "${sentence}"`,
-          points: 1,
-        });
-      } else {
-        const snippet = sentence.length > 140 ? `${sentence.slice(0, 140)}...` : sentence;
-        const promptByDiff =
-          difficulty === 'makkelijk'
-            ? `Wat wordt er in de lesstof "${titel}" gezegd over "${targetWord}"?`
-            : difficulty === 'moeilijk'
-            ? `Leg in eigen woorden het verband en de betekenis uit van "${targetWord}" binnen de lesstof "${titel}" (verwijs naar: "${snippet.slice(0, 60)}...").`
-            : `Leg op basis van de lesstof "${titel}" uit wat bedoeld wordt met "${targetWord}".`;
-
-        questionsOut.push({
-          id: i + 1,
-          category: vak,
-          questionType: 'open',
-          questionText: promptByDiff,
-          correctAnswer: sentence,
-          rubric: `Benoem de kern uit de lesstof rondom ${targetWord}: ${sentence}`,
-          points: 2,
-        });
-      }
-    }
+    const questionsOut = generateLocalStudyFlowQuiz({
+      vak,
+      titel,
+      tekst,
+      count,
+      questionType,
+      difficulty,
+    });
 
     return jsonResponse({ success: true, questions: questionsOut });
   }
@@ -899,23 +881,9 @@ async function handleStaticApi(pathname: string, search: string, method: string,
           feedback = rubric ? `Juiste antwoord: ${correctAns}. ${rubric}` : `Juiste antwoord: ${correctAns}`;
         }
       } else {
-        const res = gradeOpenLocal(
-          {
-            id: qId,
-            formId: 0,
-            category: qCategory,
-            questionType: 'open',
-            questionText: qText,
-            options: '[]',
-            correctAnswer: correctAns,
-            points: qPoints,
-            rubric,
-            orderIndex: i,
-          },
-          studentAns
-        );
+        const res = gradeLocalStudyFlowOpen(correctAns, rubric, studentAns, qPoints);
         scoreAwarded = res.scoreAwarded;
-        isCorrect = res.isCorrect === 1;
+        isCorrect = res.isCorrect;
         feedback = res.feedback;
       }
 

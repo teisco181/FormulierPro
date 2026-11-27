@@ -13,11 +13,19 @@ import {
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  LogIn,
+  UserCheck,
+  BookmarkCheck,
 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext.tsx';
 import {
   StudyFlowStofPayload,
   StudyFlowResultaatVraag,
   postToStudyFlowResult,
+  buildStudyFlowFormPayload,
+  savePendingStudyFlowQuiz,
+  updatePendingStudyFlowAttempt,
+  syncPendingStudyFlowQuizzes,
 } from '../lib/studyflow.ts';
 
 interface StudyFlowRunnerProps {
@@ -59,6 +67,7 @@ interface StudyFlowResultState {
 }
 
 export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe }) => {
+  const { user, getToken, openAuthModal } = useAuth();
   const [phase, setPhase] = useState<'configure' | 'taking' | 'result'>('configure');
 
   // Quiz configuration
@@ -74,11 +83,30 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
   const [currentIdx, setCurrentIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
 
+  // Account sync state
+  const [savedFormUid, setSavedFormUid] = useState<string | null>(null);
+  const [clientQuizId, setClientQuizId] = useState<string | null>(null);
+  const [accountSyncStatus, setAccountSyncStatus] = useState<'idle' | 'saved' | 'pending'>('idle');
+  const quizStartTimeRef = useRef<number>(Date.now());
+
   // Grading & result state
   const [grading, setGrading] = useState(false);
   const [gradeError, setGradeError] = useState<string | null>(null);
   const [result, setResult] = useState<StudyFlowResultState | null>(null);
   const sentResultRef = useRef(false);
+
+  // Sync pending StudyFlow quizzes when user signs in inside the iframe
+  useEffect(() => {
+    if (!user) return;
+    syncPendingStudyFlowQuizzes({ userEmail: user.email, getToken })
+      .then(({ savedFormUids }) => {
+        if (clientQuizId && savedFormUids[clientQuizId]) {
+          setSavedFormUid(savedFormUids[clientQuizId]);
+          setAccountSyncStatus('saved');
+        }
+      })
+      .catch(() => {});
+  }, [user?.uid]);
 
   // Reset to configure screen when new STUDYFLOW_STOF arrives
   useEffect(() => {
@@ -90,6 +118,9 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
       setResult(null);
       setGenerateError(null);
       setGradeError(null);
+      setSavedFormUid(null);
+      setClientQuizId(null);
+      setAccountSyncStatus('idle');
       sentResultRef.current = false;
     }
   }, [stof]);
@@ -137,6 +168,69 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
         throw new Error(data.error || 'Kon geen toets genereren uit de ontvangen lesstof.');
       }
 
+      const nextClientQuizId = `sf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      const formPayload = buildStudyFlowFormPayload({
+        stof,
+        questions: data.questions,
+        count,
+        questionType,
+        difficulty,
+        creatorEmail: user?.email || stof.email || null,
+      });
+
+      setClientQuizId(nextClientQuizId);
+      setSavedFormUid(null);
+      setAccountSyncStatus('idle');
+      quizStartTimeRef.current = Date.now();
+
+      if (user) {
+        try {
+          const token = await getToken();
+          if (token) {
+            const saveRes = await fetch('/api/forms', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify(formPayload),
+            });
+            if (saveRes.ok) {
+              const saveData = await saveRes.json();
+              const createdUid = saveData?.form?.formUid;
+              if (createdUid) {
+                setSavedFormUid(createdUid);
+                setAccountSyncStatus('saved');
+              }
+            } else {
+              savePendingStudyFlowQuiz({
+                clientQuizId: nextClientQuizId,
+                targetEmail: (user.email || stof.email || '').trim().toLowerCase() || null,
+                createdAt: new Date().toISOString(),
+                formPayload,
+              });
+              setAccountSyncStatus('pending');
+            }
+          }
+        } catch {
+          savePendingStudyFlowQuiz({
+            clientQuizId: nextClientQuizId,
+            targetEmail: (user.email || stof.email || '').trim().toLowerCase() || null,
+            createdAt: new Date().toISOString(),
+            formPayload,
+          });
+          setAccountSyncStatus('pending');
+        }
+      } else {
+        savePendingStudyFlowQuiz({
+          clientQuizId: nextClientQuizId,
+          targetEmail: stof.email?.trim().toLowerCase() || null,
+          createdAt: new Date().toISOString(),
+          formPayload,
+        });
+        setAccountSyncStatus('pending');
+      }
+
       setQuestions(data.questions);
       setAnswers({});
       setCurrentIdx(0);
@@ -178,6 +272,36 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
         vragen: Array.isArray(data.vragen) ? data.vragen : [],
       };
 
+      const timeSpentSeconds = Math.max(1, Math.round((Date.now() - quizStartTimeRef.current) / 1000));
+      const detailedAnswers = Array.isArray(data.answers) ? data.answers : [];
+      const attemptPayload = {
+        totalScore: payload.score,
+        maxScore: payload.maxScore,
+        percentage: Number(data.percentage) || 0,
+        timeSpentSeconds,
+        answers: detailedAnswers,
+      };
+
+      if (user && savedFormUid) {
+        try {
+          const token = await getToken();
+          if (token) {
+            await fetch(`/api/forms/${encodeURIComponent(savedFormUid)}/record-studyflow-attempt`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify(attemptPayload),
+            });
+          }
+        } catch {
+          // Ignore non-fatal attempt sync errors
+        }
+      } else if (clientQuizId) {
+        updatePendingStudyFlowAttempt(clientQuizId, attemptPayload);
+      }
+
       let savedToStudyFlow = false;
       if (inIframe && !sentResultRef.current) {
         savedToStudyFlow = postToStudyFlowResult(payload);
@@ -195,7 +319,7 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
         maxScore: payload.maxScore,
         percentage: Number(data.percentage) || 0,
         vragen: payload.vragen,
-        answers: Array.isArray(data.answers) ? data.answers : [],
+        answers: detailedAnswers,
         savedToStudyFlow,
       });
       setPhase('result');
@@ -229,6 +353,40 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
             <p className="text-xs text-slate-500 leading-relaxed">
               Kies het aantal vragen, het vraagtype en de moeilijkheidsgraad. Alle vragen worden in het Nederlands gegenereerd op basis van jouw lesstof.
             </p>
+          </div>
+
+          {/* FormulierPro account sync status bar */}
+          <div
+            className={`rounded-2xl border px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs ${
+              user
+                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                : 'bg-slate-50 border-slate-200 text-slate-700'
+            }`}
+          >
+            {user ? (
+              <div className="flex items-center gap-2 font-semibold">
+                <UserCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>
+                  Toets wordt automatisch opgeslagen in je FormulierPro-account ({user.email})
+                </span>
+              </div>
+            ) : (
+              <>
+                <span className="text-slate-600">
+                  {stof.email
+                    ? `Log in bij FormulierPro (${stof.email}) om deze toets direct in je account op te slaan.`
+                    : 'Log in bij FormulierPro om deze toets in je eigen account op te slaan.'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => openAuthModal('login')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs transition-colors"
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  Inloggen
+                </button>
+              </>
+            )}
           </div>
 
           {/* Collapsible source text preview */}
@@ -582,12 +740,29 @@ export const StudyFlowRunner: React.FC<StudyFlowRunnerProps> = ({ stof, inIframe
           </h1>
           <p className="text-xs text-slate-500 mt-1">{stof.vak}</p>
 
-          {result.savedToStudyFlow && (
-            <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span>Resultaat is opgeslagen in StudyFlow</span>
-            </div>
-          )}
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+            {result.savedToStudyFlow && (
+              <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>Resultaat is opgeslagen in StudyFlow</span>
+              </div>
+            )}
+            {user && accountSyncStatus === 'saved' ? (
+              <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-800 text-xs font-bold">
+                <BookmarkCheck className="w-4 h-4 text-indigo-600 shrink-0" />
+                <span>Toets opgeslagen in FormulierPro ({user.email})</span>
+              </div>
+            ) : !user && accountSyncStatus === 'pending' ? (
+              <button
+                type="button"
+                onClick={() => openAuthModal('login')}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-900 text-xs font-bold transition-colors"
+              >
+                <LogIn className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>Log in om deze toets op te slaan in je FormulierPro-account</span>
+              </button>
+            ) : null}
+          </div>
 
           <div className="flex items-center justify-center gap-8 my-6">
             <div>

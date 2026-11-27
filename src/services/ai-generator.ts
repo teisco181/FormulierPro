@@ -135,6 +135,13 @@ Maak een toets van exact ${count} vragen in het Nederlands, passend bij het nive
 STRIKTE BRONREGEL:
 Gebruik UITSLUITEND de onderstaande lesstof als bron. Verzin geen externe feiten die niet in de tekst staan. Elke vraag en elk juist antwoord moet aantoonbaar over deze lesstof gaan.
 
+ALS DE LESSTOF EEN WOORDENLIJST OF BEGRIPPENLIJST IS (bijv. Nederlands - Duits/Engels/Frans, gescheiden met tabs en enters of dubbele punten):
+- Elke regel of elk paar vormt één apart woord/begrip met bijbehorende vertaling of uitleg.
+- Zet NOOIT de hele woordenlijst in de vraagtekst!
+- Stel per vraag één duidelijke, korte overhoorvraag over één specifiek woord of begrip (bijv. "Wat betekent 'der Fahrplan'?", "Hoe zeg je 'de halte' in het Duits?", of een korte invulzin met één woord uit de lijst).
+- Kies bij meerkeuze realistische afleiders uit de andere woorden in dezelfde woordenlijst (bij voorkeur met hetzelfde lidwoord of woordsoort).
+- Sla eventueel onvolledige of afgebroken termen (zoals alleen een los lidwoord zonder zelfstandig naamwoord) over.
+
 ${typeInstruction}
 ${difficultyInstruction}
 

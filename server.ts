@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 import * as XLSX from 'xlsx';
 import { db } from './src/db/index.ts';
 import { forms, questions, submissions, submissionAnswers, users } from './src/db/schema.ts';
-import { eq, desc, and, inArray } from 'drizzle-orm';
+import { eq, desc, and, inArray, sql } from 'drizzle-orm';
 import { requireAuth, optionalAuth, AuthRequest } from './src/middleware/auth.ts';
 import { getOrCreateUser } from './src/db/users.ts';
 import { gradeOpenQuestion } from './src/services/ai-grader.ts';
@@ -23,6 +23,28 @@ app.use(express.json({ limit: '10mb' }));
 function generateUid(prefix = 'form'): string {
   const randomStr = Math.random().toString(36).substring(2, 9);
   return `${prefix}-${Date.now().toString(36)}-${randomStr}`;
+}
+
+async function getOwnerUidsForUser(user: NonNullable<AuthRequest['user']>): Promise<string[]> {
+  const uids = new Set<string>([user.uid]);
+  if (user.email && user.email_verified === true) {
+    const normalizedEmail = user.email.toLowerCase().trim();
+    const matchingUsers = await db
+      .select({ uid: users.uid })
+      .from(users)
+      .where(sql`lower(${users.email}) = ${normalizedEmail}`);
+    for (const row of matchingUsers) {
+      if (row.uid) uids.add(row.uid);
+    }
+  }
+  return Array.from(uids);
+}
+
+async function isFormOwnerServer(user: AuthRequest['user'], creatorUid: string): Promise<boolean> {
+  if (!user) return false;
+  if (user.uid === creatorUid) return true;
+  const ownerUids = await getOwnerUidsForUser(user);
+  return ownerUids.includes(creatorUid);
 }
 
 // 1. Health check
@@ -47,8 +69,12 @@ app.post('/api/auth/sync', requireAuth, async (req: AuthRequest, res: Response) 
 // 3. Maker Forms Management
 app.get('/api/forms', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const uid = req.user!.uid;
-    const userForms = await db.select().from(forms).where(eq(forms.creatorUid, uid)).orderBy(desc(forms.createdAt));
+    const ownerUids = await getOwnerUidsForUser(req.user!);
+    const userForms = await db
+      .select()
+      .from(forms)
+      .where(inArray(forms.creatorUid, ownerUids))
+      .orderBy(desc(forms.createdAt));
     res.json(userForms);
   } catch (error: any) {
     console.error('Error fetching forms:', error);
@@ -66,7 +92,7 @@ app.get('/api/forms/:formUid', optionalAuth, async (req: AuthRequest, res: Respo
     }
 
     const form = formList[0];
-    const isCreator = req.user && req.user.uid === form.creatorUid;
+    const isCreator = await isFormOwnerServer(req.user, form.creatorUid);
 
     const allQuestions = await db
       .select()
@@ -207,7 +233,7 @@ app.put('/api/forms/:formUid', requireAuth, async (req: AuthRequest, res: Respon
     if (!existing.length) {
       return res.status(404).json({ error: 'Formulier niet gevonden.' });
     }
-    if (existing[0].creatorUid !== uid) {
+    if (!(await isFormOwnerServer(req.user!, existing[0].creatorUid))) {
       return res.status(403).json({ error: 'Geen toestemming om dit formulier te bewerken.' });
     }
 
@@ -288,7 +314,7 @@ app.delete('/api/forms/:formUid', requireAuth, async (req: AuthRequest, res: Res
     if (!existing.length) {
       return res.status(404).json({ error: 'Formulier niet gevonden.' });
     }
-    if (existing[0].creatorUid !== uid) {
+    if (!(await isFormOwnerServer(req.user!, existing[0].creatorUid))) {
       return res.status(403).json({ error: 'Geen toestemming om dit formulier te verwijderen.' });
     }
 
@@ -490,6 +516,81 @@ app.post('/api/studyflow/grade', async (req: Request, res: Response) => {
   }
 });
 
+// 4d. Record completed StudyFlow attempt under an existing StudyFlow-saved form
+app.post('/api/forms/:formUid/record-studyflow-attempt', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { formUid } = req.params;
+    const formList = await db.select().from(forms).where(eq(forms.formUid, formUid)).limit(1);
+    if (!formList.length) {
+      return res.status(404).json({ error: 'Formulier niet gevonden.' });
+    }
+    const form = formList[0];
+    if (!(await isFormOwnerServer(req.user!, form.creatorUid))) {
+      return res.status(403).json({ error: 'Geen toestemming voor dit formulier.' });
+    }
+
+    const totalScore = Math.max(0, Number(req.body?.totalScore) || 0);
+    const maxScore = Math.max(0, Number(req.body?.maxScore) || 0);
+    const percentage =
+      typeof req.body?.percentage === 'number'
+        ? Math.max(0, Math.min(100, Math.round(req.body.percentage)))
+        : maxScore > 0
+        ? Math.round((totalScore / maxScore) * 100)
+        : 100;
+    const timeSpentSeconds = Math.max(0, Number(req.body?.timeSpentSeconds) || 0);
+    const email = req.user!.email ? req.user!.email.toLowerCase().trim() : null;
+    const name = req.user!.name || (email ? email.split('@')[0] : 'StudyFlow');
+    const submissionUid = generateUid('sub');
+
+    const [createdSub] = await db
+      .insert(submissions)
+      .values({
+        formId: form.id,
+        submissionUid,
+        respondentEmail: email,
+        respondentName: name,
+        totalScore,
+        maxScore,
+        percentage,
+        timeSpentSeconds,
+        status: 'submitted',
+        completedAt: new Date(),
+      })
+      .returning();
+
+    const dbQuestions = await db
+      .select()
+      .from(questions)
+      .where(eq(questions.formId, form.id))
+      .orderBy(questions.orderIndex);
+
+    const incomingAnswers = Array.isArray(req.body?.answers) ? req.body.answers.slice(0, 100) : [];
+    if (incomingAnswers.length > 0) {
+      const answerRows = incomingAnswers.map((a: any, idx: number) => {
+        const matchedQ = dbQuestions[idx] || dbQuestions.find((q) => q.questionText === a?.questionText);
+        return {
+          submissionId: createdSub.id,
+          questionId: matchedQ ? matchedQ.id : null,
+          questionText: String(a?.questionText || matchedQ?.questionText || ''),
+          questionCategory: String(a?.questionCategory || matchedQ?.category || 'Algemeen'),
+          questionType: String(a?.questionType || matchedQ?.questionType || 'multiple_choice'),
+          answerValue: String(a?.answerValue || ''),
+          isCorrect: a?.isCorrect ? 1 : 0,
+          scoreAwarded: Math.max(0, Number(a?.scoreAwarded) || 0),
+          maxPoints: Math.max(1, Number(a?.maxPoints) || matchedQ?.points || 1),
+          aiFeedback: String(a?.aiFeedback || ''),
+        };
+      });
+      await db.insert(submissionAnswers).values(answerRows);
+    }
+
+    res.json({ success: true, submissionUid: createdSub.submissionUid });
+  } catch (error: any) {
+    console.error('Error recording StudyFlow attempt:', error);
+    res.status(500).json({ error: 'Kon StudyFlow-resultaat niet opslaan.' });
+  }
+});
+
 // 5. Test Session & Submission Handling
 app.post('/api/forms/:formUid/start', async (req: Request, res: Response) => {
   try {
@@ -679,7 +780,7 @@ app.post('/api/submissions/:submissionUid/unlock', optionalAuth, async (req: Aut
     }
     const form = formList[0];
 
-    const isCreator = req.user && req.user.uid === form.creatorUid;
+    const isCreator = await isFormOwnerServer(req.user, form.creatorUid);
     const isPasscodeValid = passcode && passcode.trim() === form.securityPasscode.trim();
 
     if (!isCreator && !isPasscodeValid) {
@@ -947,7 +1048,7 @@ app.get('/api/forms/:formUid/analytics', requireAuth, async (req: AuthRequest, r
       return res.status(404).json({ error: 'Formulier niet gevonden.' });
     }
     const form = formList[0];
-    if (form.creatorUid !== uid) {
+    if (!(await isFormOwnerServer(req.user!, form.creatorUid))) {
       return res.status(403).json({ error: 'Geen toegang tot deze analyses.' });
     }
 
@@ -1082,7 +1183,7 @@ app.get('/api/forms/:formUid/export/:format', requireAuth, async (req: AuthReque
       return res.status(404).json({ error: 'Formulier niet gevonden.' });
     }
     const form = formList[0];
-    if (form.creatorUid !== uid) {
+    if (!(await isFormOwnerServer(req.user!, form.creatorUid))) {
       return res.status(403).json({ error: 'Geen toegang tot exporteren.' });
     }
 

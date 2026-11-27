@@ -14,6 +14,7 @@ import {
   isInsideIframe,
   isEmbeddedInStudyFlow,
   postToStudyFlowReady,
+  syncPendingStudyFlowQuizzes,
 } from './lib/studyflow.ts';
 import { FormModel } from './types/index.ts';
 
@@ -31,6 +32,13 @@ function MainApp() {
   const [inIframe] = useState<boolean>(() => isInsideIframe());
   const [studyFlowEmbedded] = useState<boolean>(() => isEmbeddedInStudyFlow());
   const [studyFlowStof, setStudyFlowStof] = useState<StudyFlowStofPayload | null>(null);
+  const [studyFlowUserEmail, setStudyFlowUserEmail] = useState<string | null>(() => {
+    try {
+      return window.localStorage.getItem('formulierpro_studyflow_email');
+    } catch {
+      return null;
+    }
+  });
 
   // StudyFlow postMessage integration (runs only inside iframe)
   useEffect(() => {
@@ -41,16 +49,46 @@ function MainApp() {
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
 
+      if (msg.type === 'STUDYFLOW_USER' && msg.payload && typeof msg.payload === 'object') {
+        const rawEmail = msg.payload.email || msg.payload.userEmail || msg.payload.gebruikerEmail;
+        if (typeof rawEmail === 'string' && rawEmail.trim()) {
+          const cleanEmail = rawEmail.trim().toLowerCase();
+          setStudyFlowUserEmail(cleanEmail);
+          setStudyFlowStof((prev) => (prev ? { ...prev, email: cleanEmail } : prev));
+          try {
+            window.localStorage.setItem('formulierpro_studyflow_email', cleanEmail);
+          } catch {
+            // Ignore localStorage quota errors
+          }
+        }
+      }
+
       if (msg.type === 'STUDYFLOW_STOF' && msg.payload && typeof msg.payload === 'object') {
         const vak = typeof msg.payload.vak === 'string' ? msg.payload.vak.trim() : '';
         const titel = typeof msg.payload.titel === 'string' ? msg.payload.titel.trim() : '';
         const tekst = typeof msg.payload.tekst === 'string' ? msg.payload.tekst.trim() : '';
+        const rawEmail =
+          msg.payload.email || msg.payload.userEmail || msg.payload.gebruikerEmail || studyFlowUserEmail;
+        const cleanEmail = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim().toLowerCase() : undefined;
+        const rawNaam = msg.payload.naam || msg.payload.name;
+        const cleanNaam = typeof rawNaam === 'string' && rawNaam.trim() ? rawNaam.trim() : undefined;
+
+        if (cleanEmail) {
+          setStudyFlowUserEmail(cleanEmail);
+          try {
+            window.localStorage.setItem('formulierpro_studyflow_email', cleanEmail);
+          } catch {
+            // Ignore localStorage quota errors
+          }
+        }
 
         if (tekst) {
           const nextStof: StudyFlowStofPayload = {
             vak: vak || 'Algemeen',
             titel: titel || 'Lesstof',
             tekst,
+            ...(cleanEmail ? { email: cleanEmail } : {}),
+            ...(cleanNaam ? { naam: cleanNaam } : {}),
           };
           setStudyFlowStof(nextStof);
           try {
@@ -106,11 +144,21 @@ function MainApp() {
   };
 
   useEffect(() => {
+    let cancelled = false;
     if (user) {
-      fetchForms();
+      syncPendingStudyFlowQuizzes({ userEmail: user.email, getToken })
+        .catch(() => ({ syncedCount: 0, savedFormUids: {} }))
+        .finally(() => {
+          if (!cancelled) {
+            fetchForms();
+          }
+        });
     } else {
       setForms([]);
     }
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
   const handleOpenNewForm = () => {
@@ -275,6 +323,7 @@ function MainApp() {
     return (
       <div className="w-full bg-slate-50 font-['Plus_Jakarta_Sans',sans-serif]">
         <StudyFlowRunner stof={studyFlowStof} inIframe={inIframe} />
+        <AuthModal />
       </div>
     );
   }

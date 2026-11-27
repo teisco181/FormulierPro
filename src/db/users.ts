@@ -3,10 +3,11 @@ import { users } from './schema.ts';
 import { eq } from 'drizzle-orm';
 
 export async function getOrCreateUser(uid: string, email: string, name?: string) {
+  const normalizedEmail = email.toLowerCase().trim();
   try {
     const existing = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
     if (existing.length > 0) {
-      const nextEmail = email || existing[0].email;
+      const nextEmail = normalizedEmail || existing[0].email;
       const nextName = name || existing[0].name;
       if (nextEmail !== existing[0].email || nextName !== existing[0].name) {
         const updated = await db
@@ -22,8 +23,8 @@ export async function getOrCreateUser(uid: string, email: string, name?: string)
     const inserted = await db.insert(users)
       .values({
         uid,
-        email,
-        name: name || email.split('@')[0],
+        email: normalizedEmail,
+        name: name || normalizedEmail.split('@')[0],
       })
       .returning();
 
